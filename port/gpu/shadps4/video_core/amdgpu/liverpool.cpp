@@ -441,6 +441,15 @@ void Liverpool::NotePendingWrite(const PM4CmdWriteData& write_data, u32 num_byte
         {write_data.Address<VAddr>(), data, num_bytes, rasterizer->DrawPipeHead()});
 }
 
+void Liverpool::NotePendingRelease(const PM4CmdReleaseMem& release_mem) {
+    const auto sel = release_mem.data_sel.Value();
+    if (sel != DataSelect::Data32Low && sel != DataSelect::Data64) {
+        return; // clocks and GDS stores: no value known here
+    }
+    pending_fences.push_back({release_mem.Address<VAddr>(), release_mem.DataQWord(),
+                              sel == DataSelect::Data64 ? 8u : 4u, rasterizer->DrawPipeHead()});
+}
+
 bool Liverpool::PendingFenceValue(VAddr address, u32& value) {
     for (auto it = pending_fences.rbegin(); it != pending_fences.rend(); ++it) {
         if (rasterizer->DrawPipeReached(it->position)) {
@@ -1707,6 +1716,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 if (rasterizer->RunInOrder(&RunWriteData, header,
                                            (header->type3.count.Value() + 1) * sizeof(u32),
                                            TlgToggle::PipelinedMemoryWrites)) {
+                    NotePendingWrite(*write_data, data_size);
                     rasterizer->NotePendingGpuWrite(write_data->Address<VAddr>(), data_size);
                 }
                 break;
@@ -1735,6 +1745,24 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            // tlg: as on the graphics queue, a fence handed to the recording thread counts as
+            // written: what follows on this queue runs after it there, or drains first.
+            // Test switch for A/B runs: TLG_DBG_NO_COMPUTE_FENCE=<file>, skip off while it exists.
+            static const char* dbg_file = std::getenv("TLG_DBG_NO_COMPUTE_FENCE");
+            bool dbg_off = false;
+            if (dbg_file) {
+                if (std::FILE* f = std::fopen(dbg_file, "rb")) {
+                    std::fclose(f);
+                    dbg_off = true;
+                }
+            }
+            if (u32 value; pipelined && !dbg_off &&
+                           wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory &&
+                           !TlgToggle::Disabled(TlgToggle::PendingFenceWaits) &&
+                           PendingFenceValue(wait_reg_mem->Address<VAddr>(), value) &&
+                           wait_reg_mem->TestValue(value)) {
+                break;
+            }
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 // tlg: the value may come from a fence the recording thread has yet to write.
                 if (pipelined && !rasterizer->DrawPipeIdle()) {
@@ -1750,7 +1778,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 ComputeReleaseMem task;
                 std::memcpy(task.packet, header, sizeof(task.packet));
                 task.pipe_id = queue.pipe_id;
-                rasterizer->RunInOrder(&RunComputeReleaseMem, &task, sizeof(task));
+                if (rasterizer->RunInOrder(&RunComputeReleaseMem, &task, sizeof(task))) {
+                    NotePendingRelease(*reinterpret_cast<const PM4CmdReleaseMem*>(header));
+                }
                 break;
             }
             // tlg: copies deferred to the recording thread precede writes the guest sees, and
